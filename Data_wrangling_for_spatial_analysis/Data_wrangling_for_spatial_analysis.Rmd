@@ -1,0 +1,408 @@
+---
+title: 'Data wrangling for spatial analysis: R Workshop'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(raster)
+library(leaflet)
+library(tmap)
+library(readr)
+library(concaveman)
+library(mgcv)
+```
+
+```{r}
+setwd("~/Doctorat/Formation/Data_wrangling_for_spatial_analysis")
+```
+Loading data
+```{r}
+dat<-read_csv("data-for-course/copepods_raw.csv")
+```
+1.1 Shape data and maps ==============================================================================================
+Initial visuals
+```{r}
+ggplot(dat)+
+  aes(x=longitude,y=latitude,color=richness_raw)+
+  geom_point()
+```
+```{r}
+ggplot(dat)+
+  aes(x = latitude,y=richness_raw)+
+  geom_point()+
+  stat_smooth()+
+```
+Introduction to maps
+```{r}
+sdat<-st_as_sf(dat,
+               coords = c("longitude","latitude"),
+               crs="+proj=longlat +datum=WGS84 +nodefs")
+```
+sf=simple features
+sf point collection
+```{r}
+sdat
+```
+basic cartography
+```{r}
+plot(sdat["richness_raw"])
+```
+Thematic maps
+```{r}
+tm_shape(sdat)+
+  tm_dots(col="richness_raw")
+```
+Customize previous plot
+```{r}
+tm1 <- tm_shape(sdat) +
+  tm_dots(col = "richness_raw",
+          palette="Blues",
+          title="Species nb")
+tm1
+```
+Save map
+```{r}
+tmap_save(tm1,
+          filename="Richness_map.png",
+          width=600,
+          height=600)
+```
+Create a sf polygon collection
+Download data from AODN
+```{r}
+shelfin<-st_read("data-for-course/data_raw/contour_5m.shp")
+shelfin
+range(shelfin$CONTOUR)
+shelf200<-dplyr::filter(shelfin, CONTOUR == 199.9)
+plot(shelf200["LENGTH"])
+```
+Create a polygon from lines
+```{r}
+ushelf200<-concaveman(shelf200)
+plot(ushelf200)
+st_is_valid(ushelf200)
+sf::sf_use_s2(FALSE)
+ushelf200 <- st_buffer(ushelf200, 0.0)
+ushelf200 <- st_zm(ushelf200)
+st_write(ushelf200, "data-for-course/spatial-data/aus_shelf.shp")
+```
+
+```{r}
+aus<-st_read("data-for-course/spatial-data/AUS_2021_AUST_GDA2020.shp")
+shelf <- st_read("data-for-course/spatial-data/aus_shelf.shp")
+shelf
+tm_shape(shelf)+
+  tm_polygons()
+```
+ADD layers to a polygon
+```{r}
+tmap_mode("view")
+tm_shape(shelf,bbox=sdat)+
+  tm_polygons(col='blue')+
+  tm_shape(aus$geometry)+
+  tm_polygons()+
+  tm_shape(sdat)+
+  tm_dots()+
+  tmap_style("natural")
+
+tm_shape(shelf,bbox=sdat,)+
+  tm_borders(col='blue')+
+  tm_shape(aus$geometry)+
+  tm_borders()+
+  tm_shape(sdat)+
+  tm_dots()+
+  tm_basemap("Stamen.Watercolor")+
+  tm_tiles("Stamen.TonerLabels")
+```
+Introduction to dplyr
+Table joins with spatial data
+```{r}
+routes<-read_csv("data-for-course/Route-data.csv")
+sdat_std<-inner_join(sdat,routes,by="route")
+nrow(sdat)
+nrow(sdat_std)
+nrow(routes)
+length(unique(routes$route))
+```
+Adding new variables
+```{r}
+sdat_std <-  mutate(sdat_std,
+              richness = richness_raw/silk_area)
+sdat_std$Lat <- st_coordinates(sdat_std)[,2]
+ggplot(sdat_std)+
+  aes(x=Lat,y=richness,color=richness)+
+  geom_point()+
+  stat_smooth()+
+  theme_bw()
+save(sdat_std,file =  "data-for-course/spatial-data/copepods_standardised.rda")
+```
+
+1.2 GIS and data analysis ============================================================================================
+Changes Coordinates system
+```{r}
+shelf <- st_read("data-for-course/spatial-data/aus_shelf.shp")
+shelf$shelf <- "Shelf"
+st_crs(sdat_std)==st_crs(shelf)
+shelf <- st_transform(shelf, crs = st_crs(sdat_std))
+```
+Intersecting points and polygons
+```{r}
+sdat_shelf <- st_join(sdat_std, shelf, join = st_intersects)
+names(sdat_shelf)
+unique(sdat_shelf$shelf)
+sdat_shelf <- mutate(sdat_shelf,
+                     shelf = if_else(is.na(shelf),
+                                     "Offshore",
+                                     shelf))
+table(sdat_shelf$shelf)
+```
+Mapping data of two levels
+```{r}
+tm_shape(shelf,
+         bbox = sdat_shelf)+
+  tm_polygons(col="grey10")+
+  tm_shape(sdat_shelf)+
+  tm_dots(col="shelf",palette="RdBu")+
+  tm_graticules()
+```
+Analysis of richness by continental shelf/offshore
+```{r}
+ggplot(sdat_shelf)+
+  aes(x=Lat,y=richness,color=shelf)+
+  geom_point(alpha=0.5,size=0.2)+
+  stat_smooth()+
+  theme_bw()
+```
+Introduction to raster data
+```{r}
+rsst <- raster('data-for-course/spatial-data/MeanAVHRRSST.grd')
+plot(rsst)
+```
+Extracting temperatures at the sampling sites
+```{r}
+sdat_std$sst <- extract(rsst, sdat_std)
+ggplot(sdat_std, aes(sst, richness)) +
+  geom_point() +
+  theme_minimal()
+with(sdat_std, cor.test(sst, richness))
+filter(sdat_std, is.na(sst))
+sdat_sst <- filter(sdat_std, !is.na(sst))
+```
+Simple model of SST
+```{r}
+m1 <- gam(richness ~ s(sst, k=5), data = sdat_sst, family = 'poisson')
+plot(m1)
+```
+Accounting for regions
+```{r}
+sdat_sst$Region <- factor(sdat_sst$region)
+m1 <- gam(richness ~ s(sst, k=5, by = Region) + Region, data = sdat_sst, family = 'poisson')
+sdat_sst$pred_m1 <- predict(m1, type = "response")
+ggplot(sdat_sst) +
+  aes(x = sst, y = richness, color = Region)+
+  geom_point(size = 0.2, alpha = 0.3) +
+  geom_line(aes(y = pred_m1), size = 1) +
+  facet_grid(.~Region) +
+  theme_bw()
+```
+Accounting for overdispersion
+```{r}
+deviance(m1)
+m1$df.residual
+m2 <- gam(richness ~ s(sst, by = Region) + Region, data = sdat_sst, family = mgcv::negbin(theta = 1.99))
+deviance(m2)
+m2$df.residual
+```
+Rootograms for checking model fit
+```{r}
+sdat_sst$pred_m2 <- predict(m2, type = "response")
+
+ggplot(sdat_sst) +
+  aes(x = sst, y = richness, color = Region)+
+  geom_point(size = 0.2, alpha = 0.3) +
+  geom_line(aes(y = pred_m2), size = 1) +
+  facet_grid(.~Region) +
+  theme_bw()
+```
+
+Spatial models of SST and richness
+Using longitude as a covariate
+```{r}
+sdat_sst$x <- st_coordinates(sdat_sst)[,1]
+m_int <- gam(richness ~s(sst, x), data = sdat_sst, family = mgcv::negbin(theta = 2.03))
+
+m_int$df.residual
+deviance(m_int)
+plot(m_int)
+```
+Challenge topic: Spatial ‘clumping’ model for the West Coast
+```{r}
+sdat_sst$x <- st_coordinates(sdat_sst)[,1]
+sdat_sst$y <- st_coordinates(sdat_sst)[,2]
+
+sdat_west <- filter(sdat_sst, (x < 120) & (y > -40))
+sdat_sst$group <- cut(sdat_sst$y, breaks = seq(-37, -16, by = 1.5))
+m4 <- gamm(richness ~ s(sst), data = sdat_sst,
+           random = list(group=~1),
+          family = mgcv::negbin(theta = 3.8))
+plot(m4$gam)
+summary(m4$lme)
+```
+Challenge topic: Exploratory model with x and y as smoothers
+```{r}
+sdat_west2 <- st_transform(sdat_west, crs = 3577)
+sdat_west2$x <- st_coordinates(sdat_west2)[,1]
+sdat_west2$y <- st_coordinates(sdat_west2)[,2]
+
+m5 <- gam(richness ~ s(sst) + s(x, y, bs = "gp"),
+          data = sdat_west2,
+          family = mgcv::negbin(theta = 3.8))
+plot(m5)
+```
+Challenge topic: Modelling spatial autocorrelation
+```{r}
+m6 <- gamm(richness ~ s(sst),
+                #This next step includes the spatial AC
+                # with an exponential correlation structure
+                correlation = corExp(form = ~x + y),
+                data = sdat_west2, family =
+                  mgcv::negbin(theta = 3.8))
+
+plot(m6$gam)
+
+summary(m6$lme)
+```
+Generating and mapping model predictions
+```{r}
+sdat_sst$richness_pred <- predict(m_int, type = "response")
+tm_shape(sdat_sst) +
+  tm_dots(col = "richness_pred") 
+```
+
+Generating predictions anywhere
+```{r}
+rsst2 <- aggregate(rsst, 2)
+par(mfrow = c(1,2))
+plot(rsst)
+plot(rsst2)
+```
+```{r}
+icell <- 1:ncell(rsst)
+pred <- data.frame(sst = rsst2[icell],
+                       cells = icell,
+                       x = xFromCell(rsst2, icell),
+                      y = yFromCell(rsst2, icell))
+
+pred <- na.omit(pred)
+head(pred)
+```
+
+```{r}
+pred$richness_pred <- predict(m_int, newdata = pred, type = "response")
+head(pred)
+rpred <- raster(rsst2)
+rpred[pred$cells] <- pred$richness_pred
+tm_shape(aus, bbox = rpred) +
+  tm_polygons(col = "white") +
+  tm_shape(rpred) +
+  tm_raster(palette = "RdPu",
+            title= "Richness", alpha = 0.8, n=10) +
+  tm_layout(bg.color = "grey20",
+            legend.position = c("left", "top"),
+            legend.text.color = "white",
+            legend.title.color = "white")
+```
+```{r}
+ggplot(sdat_sst) +
+  aes(x = sst, y = richness_pred, color = x, alpha = 0.5) +
+  geom_point() +
+    theme_bw() +
+  ylab("Richness (predicted)") +
+  xlab(expression('SST ('*~degree*C*')'))
+```
+Create an interactive map
+```{r}
+print(object.size(sdat_sst), units = "Kb")
+leaflet(sdat_sst) %>%
+  addTiles() %>%
+  addCircleMarkers(radius = 0.5)
+```
+
+```{r}
+copedomain <- range(sdat_sst$richness)
+oranges <- colorNumeric("YlOrRd", domain = copedomain)
+leaflet(sdat_sst) %>%
+  addProviderTiles("Esri.OceanBasemap") %>%
+  addCircleMarkers( radius = 3,
+                   color = 'grey80',
+                   weight = 0.1,
+                   fill = TRUE,
+                   fillOpacity = 0.7, fillColor = ~oranges(richness)) %>%
+  addLegend("topright", pal = oranges,
+values = copedomain,
+title = "Number of copepod species",
+opacity = 1) 
+```
+Bonus material: Changing the map projection
+```{r}
+tmaptools::get_proj4("robin", output = "character")
+robin <-  "+proj=robin +lon_0=100 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs +towgs84=0,0,0"
+tm_shape(rsst, projection = robin) +
+  tm_raster(palette = "-RdBu", title = "SST") +
+  tm_shape(aus, projection = robin) +
+  tm_polygons(col = "wheat") +
+  tm_compass() 
+```
+Bonus material: calculating distances with sf
+```{r}
+tas_ext <- extent(140, 155, -45, -39)
+stas <- st_crop(sdat_shelf, tas_ext)
+```
+
+Slow but precise way
+```{r}
+dist <- st_distance(stas, shelf)
+```
+
+Fast but less precise way
+```{r}
+tas_utm <- crs("+proj=utm +zone=55 +datum=WGS84 +units=m +no_defs")
+stas2 <- st_transform(stas, crs = tas_utm)
+shelf2 <- st_crop(shelf, tas_ext)
+shelf2 <- st_transform(shelf2, crs = tas_utm)
+
+dist2 <- st_distance(stas2, shelf2)
+stas2$dist <- as.numeric(dist2)/1000
+```
+Plot samples by their distance to the shelf
+```{r}
+tm_shape(stas2) +
+  tm_dots() +
+  tm_shape(shelf2) +
+  tm_polygons(col = "lightblue") +
+  tm_shape(stas2) +
+  tm_symbols(col = "dist", alpha = 0.5,
+             title.col = "Distance from \n shelf (km)")
+```
+```{r}
+tm_shape(shelf2) +
+  tm_polygons(col = "lightblue") +
+tm_shape(aus, projection = tas_utm) +
+  tm_polygons() +
+  tm_shape(stas2) +
+  tm_symbols(col = "dist", alpha = 0.5,
+             title.col = "Distance from \n shelf (km)")
+```
+```{r}
+ggplot(stas2) +
+  aes(x = dist, y = richness) +
+  geom_point() +
+  stat_smooth()
+```
+
